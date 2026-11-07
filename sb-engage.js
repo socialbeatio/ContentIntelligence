@@ -1,7 +1,7 @@
 /*!
  * Socialbeat Engage — pagine viste, scroll continuo e tempo di lettura.
  * Questo blocco va in testa a sb-engage.js; sotto c'è il tracker Socialbeat (Snowplow 3.10, sb-v2.js).
- * Configurazione dal tag: window.sbConfig = { appId, userCookie?, scrollEvent?, performanceTiming?, collector? }.
+ * Configurazione dal tag: window.sbConfig = { appId, userCookie?, scrollEvent?, performanceTiming?, depth?, articleSelector?, collector? }.
  * Documentazione: collector/docs/scroll-engagement.md e tracker/gtm/README.md.
  */
 (function (window, document) {
@@ -20,6 +20,9 @@
   var scrollEvent = config.scrollEvent || null;   // es. { event: "article", trigger: "scroll" }
   var urlKey = (scrollEvent && scrollEvent.urlKey) || "url";
   var titleKey = (scrollEvent && scrollEvent.titleKey) || "page_title";
+  // Profondità di lettura: quanta parte del corpo dell'articolo è passata nella finestra (0-100).
+  var depthEnabled = config.depth !== false;
+  var articleSelector = config.articleSelector || "article";
 
   // Spazio dei nomi del tracker: "sbe", messo IN TESTA alla coda.
   // Il tracker incluso sotto prende il primo nome della coda appena viene eseguito: se sulla pagina
@@ -40,6 +43,49 @@
   var currentUrl = location.href;
   var currentTitle = document.title;
   var currentViewId;
+  var currentPosition = 0;             // posizione della visualizzazione corrente nello scroll
+  var maxDepth = null;                 // profondità massima raggiunta dalla visualizzazione corrente
+
+  // Corpo dell'articolo (sbConfig.articleSelector, predefinito "article"); se manca, la pagina intera.
+  function articleBox() {
+    var element = document.querySelector(articleSelector);
+    if (element) {
+      var rect = element.getBoundingClientRect();
+      return { top: rect.top + window.pageYOffset, height: rect.height };
+    }
+    var root = document.documentElement;
+    return { top: 0, height: Math.max(root.scrollHeight, document.body ? document.body.scrollHeight : 0) };
+  }
+
+  // Aggiorna la profondità massima: fondo della finestra rispetto al corpo dell'articolo.
+  // Solo per la pagina aperta: con lo scroll continuo gli articoli successivi sono nella stessa pagina
+  // e il selettore non li distingue ancora.
+  function measureDepth() {
+    if (!depthEnabled || currentPosition > 0) return;
+    var box = articleBox();
+    if (!box.height) return;
+    var bottom = window.pageYOffset + window.innerHeight;
+    var depth = Math.round(Math.max(0, Math.min(1, (bottom - box.top) / box.height)) * 100);
+    if (maxDepth === null || depth > maxDepth) maxDepth = depth;
+  }
+
+  // Misura allo scroll, al massimo una volta per fotogramma; ascolto passivo, non rallenta la pagina.
+  var depthPending = false;
+  window.addEventListener("scroll", function () {
+    if (depthPending) return;
+    depthPending = true;
+    (window.requestAnimationFrame || setTimeout)(function () {
+      depthPending = false;
+      measureDepth();
+    });
+  }, { passive: true });
+  // Prima misura quando la pagina è pronta (un articolo più corto della finestra vale subito 100).
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", measureDepth);
+  } else {
+    measureDepth();
+  }
+  window.addEventListener("load", measureDepth);
 
   function takeReadingSeconds() {
     var ms = visibleMs + (document.hidden ? 0 : Date.now() - visibleFrom);
@@ -49,13 +95,14 @@
   }
 
   // Contesto "engagement": secondi incrementali dall'ultimo segnale, assenza prima di questo tratto.
+  // depth: profondità massima raggiunta finora (non incrementale: in analisi si usa il massimo per visualizzazione).
   function engagementContext(trigger) {
     var awaySeconds = Math.round(awayMs / 1000);
     awayMs = 0;
-    return {
-      schema: SCHEMA + "engagement/jsonschema/1-0-0",
-      data: { url: currentUrl, view_id: currentViewId, seconds: takeReadingSeconds(), away: awaySeconds, trigger: trigger }
-    };
+    measureDepth();
+    var data = { url: currentUrl, view_id: currentViewId, seconds: takeReadingSeconds(), away: awaySeconds, trigger: trigger };
+    if (maxDepth !== null && currentPosition === 0) data.depth = maxDepth;
+    return { schema: SCHEMA + "engagement/jsonschema/1-0-0", data: data };
   }
 
   function base64url(text) {
@@ -127,6 +174,8 @@
       });
     }
     currentTitle = title || document.title;
+    currentPosition = position;
+    if (position) maxDepth = null;      // nuova visualizzazione da scroll: profondità non misurata
     currentViewId = contexts[0].data.view_id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
     tracker("trackPageView", { title: title, context: contexts });
   }
