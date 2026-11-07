@@ -1,7 +1,7 @@
 /*!
  * Socialbeat Engage — pagine viste, scroll continuo e tempo di lettura.
  * Questo blocco va in testa a sb-engage.js; sotto c'è il tracker Socialbeat (Snowplow 3.10, sb-v2.js).
- * Configurazione dal tag: window.sbConfig = { appId, userCookie?, scrollEvent?, collector? }.
+ * Configurazione dal tag: window.sbConfig = { appId, userCookie?, scrollEvent?, performanceTiming?, collector? }.
  * Documentazione: collector/docs/scroll-engagement.md e tracker/gtm/README.md.
  */
 (function (window, document) {
@@ -118,6 +118,13 @@
     if (position) {
       contexts.push(engagementContext("scroll"));
       tracker("setCustomUrl", currentUrl = url);
+    } else if (config.performanceTiming !== false && window.performance && performance.timing) {
+      // Tempi di caricamento del documento: solo per la pagina aperta, non per gli articoli dello scroll.
+      // Accesi per impostazione predefinita (come il tracker Snowplow); spenti con sbConfig.performanceTiming = false.
+      contexts.push({
+        schema: "iglu:org.w3/PerformanceTiming/jsonschema/1-0-0",
+        data: JSON.parse(JSON.stringify(performance.timing))
+      });
     }
     currentTitle = title || document.title;
     currentViewId = contexts[0].data.view_id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -125,6 +132,8 @@
   }
 
   // --- Avvio (in coda: il tracker incluso sotto la esegue appena caricato) -----
+  // Il contesto automatico del tracker resta spento: allegherebbe i tempi del documento a OGNI evento,
+  // comprese le pagine viste dello scroll continuo. I tempi li aggiunge trackView solo alla prima pagina vista.
   tracker("newTracker", "cf", COLLECTOR, {
     postPath: "/i", cookieName: "sb", appId: APP_ID,
     contexts: { performanceTiming: false }
