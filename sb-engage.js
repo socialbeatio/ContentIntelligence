@@ -1,7 +1,7 @@
 /*!
  * Socialbeat Engage — pagine viste, scroll continuo e tempo di lettura.
  * Questo blocco va in testa a sb-engage.js; sotto c'è il tracker Socialbeat (Snowplow 3.10, sb-v2.js).
- * Configurazione dal tag: window.sbConfig = { appId, userCookie?, scrollEvent?, performanceTiming?, depth?, articleSelector?, collector? }.
+ * Configurazione dal tag: window.sbConfig = { appId, userCookie?, scrollEvent?, spa?, performanceTiming?, depth?, articleSelector?, collector? }.
  * Documentazione: collector/docs/scroll-engagement.md e tracker/gtm/README.md.
  */
 (function (window, document) {
@@ -23,6 +23,8 @@
   // Profondità di lettura: quanta parte del corpo dell'articolo è passata nella finestra (0-100).
   var depthEnabled = config.depth !== false;
   var articleSelector = config.articleSelector || "article";
+  // Navigazione interna dei siti SPA (Next.js…): spenta per impostazione predefinita, si accende con sbConfig.spa = true.
+  var spaEnabled = config.spa === true;
 
   // Spazio dei nomi del tracker: "sbe", messo IN TESTA alla coda.
   // Il tracker incluso sotto prende il primo nome della coda appena viene eseguito: se sulla pagina
@@ -105,6 +107,19 @@
     return { schema: SCHEMA + "engagement/jsonschema/1-0-0", data: data };
   }
 
+  // URL per il confronto "è la stessa pagina?": senza frammento (#…) e senza parametri di tracciamento
+  // (utm_*, fbclid, gclid…). Un cambio di sola ancora, o la pulizia dei parametri di una campagna
+  // fatta dal sito con replaceState, non è una nuova pagina.
+  var TRACKING_PARAM = /^(utm_.*|fbclid|gclid|gbraid|wbraid|dclid|msclkid|igshid|mc_cid|mc_eid|_ga|_gl)$/i;
+  function normalizeUrl(url) {
+    var link = document.createElement("a");
+    link.href = url;
+    var query = link.search.replace(/^\?/, "").split("&").filter(function (pair) {
+      return pair && !TRACKING_PARAM.test(decodeURIComponent(pair.split("=")[0]));
+    }).join("&");
+    return link.protocol + "//" + link.host + link.pathname + (query ? "?" + query : "");
+  }
+
   function base64url(text) {
     return btoa(unescape(encodeURIComponent(text))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
@@ -156,17 +171,22 @@
     }
   });
 
-  // Pagina vista: position 0 = pagina aperta; > 0 = articolo da scroll (porta la lettura del precedente).
-  function trackView(position, url, title) {
+  // Pagina vista. kind: "open" = pagina aperta (caricamento del documento), "scroll" = articolo dello scroll
+  // continuo (position > 0), "navigation" = navigazione interna di un sito SPA (position 0, nuova pagina aperta).
+  // scroll e navigation portano la lettura della visualizzazione precedente.
+  function trackView(position, url, title, kind) {
+    kind = kind || (position ? "scroll" : "open");
     var contexts = [{
       schema: SCHEMA + "page/jsonschema/2-0-0",
       data: { pageview_from_scroll: position > 0, scroll_position: position }
     }];
-    if (position) {
-      contexts.push(engagementContext("scroll"));
+    if (kind !== "open") {
+      contexts.push(engagementContext(kind));
+      if (kind === "navigation") tracker("setReferrerUrl", currentUrl);
       tracker("setCustomUrl", currentUrl = url);
+      maxDepth = null;                  // nuova visualizzazione: profondità non ancora misurata
     } else if (config.performanceTiming !== false && window.performance && performance.timing) {
-      // Tempi di caricamento del documento: solo per la pagina aperta, non per gli articoli dello scroll.
+      // Tempi di caricamento del documento: solo per la pagina aperta, non per scroll e navigazione interna.
       // Accesi per impostazione predefinita (come il tracker Snowplow); spenti con sbConfig.performanceTiming = false.
       contexts.push({
         schema: "iglu:org.w3/PerformanceTiming/jsonschema/1-0-0",
@@ -175,9 +195,9 @@
     }
     currentTitle = title || document.title;
     currentPosition = position;
-    if (position) maxDepth = null;      // nuova visualizzazione da scroll: profondità non misurata
     currentViewId = contexts[0].data.view_id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
     tracker("trackPageView", { title: title, context: contexts });
+    if (kind === "navigation") measureDepth();
   }
 
   // --- Avvio (in coda: il tracker incluso sotto la esegue appena caricato) -----
@@ -196,11 +216,43 @@
     var originalPush = dataLayer.push;
     dataLayer.push = function (event) {
       if (event && event.event === scrollEvent.event &&
-          (!scrollEvent.trigger || event.trigger === scrollEvent.trigger) && event[urlKey]) {
-        trackView(++scrollPosition, event[urlKey], event[titleKey]);
+          (!scrollEvent.trigger || event.trigger === scrollEvent.trigger) && event[urlKey] &&
+          normalizeUrl(event[urlKey]) !== normalizeUrl(currentUrl)) {   // stesso articolo spinto due volte: una sola pagina vista
+        trackView(++scrollPosition, event[urlKey], event[titleKey], "scroll");
       }
       return originalPush.apply(dataLayer, arguments);
     };
+  }
+
+  // Navigazione interna dei siti SPA: il documento resta lo stesso, cambia l'URL con history.pushState /
+  // replaceState o col tasto indietro (popstate). Il controllo parte dopo NAV_DELAY_MS, così:
+  // - il sito ha tempo di aggiornare document.title;
+  // - se l'URL è cambiato per lo scroll continuo, il push dello scroll arriva prima e aggiorna currentUrl:
+  //   nessuna pagina vista in più (su GDB lo scroll chiama replaceState due volte attorno al push);
+  // - più cambi ravvicinati (redirect, URL completo e poi relativo) valgono una sola navigazione.
+  // Un cambio di sola ancora (#…) non conta.
+  var NAV_DELAY_MS = 600;
+  if (spaEnabled && window.history && history.pushState) {
+    var navTimer;
+    var onUrlChange = function () {
+      clearTimeout(navTimer);
+      navTimer = setTimeout(function () {
+        if (normalizeUrl(location.href) === normalizeUrl(currentUrl)) return;
+        scrollPosition = 0;               // la nuova pagina riparte da capo anche per lo scroll continuo
+        trackView(0, location.href, document.title, "navigation");
+      }, NAV_DELAY_MS);
+    };
+    var wrapHistory = function (name) {
+      var original = history[name];
+      history[name] = function () {
+        var result = original.apply(this, arguments);
+        onUrlChange();
+        return result;
+      };
+    };
+    wrapHistory("pushState");
+    wrapHistory("replaceState");
+    window.addEventListener("popstate", onUrlChange);
   }
 })(window, document);
 
