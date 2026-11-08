@@ -1,7 +1,8 @@
 /*!
  * Socialbeat Engage — pagine viste, scroll continuo e tempo di lettura.
  * Questo blocco va in testa a sb-engage.js; sotto c'è il tracker Socialbeat (Snowplow 3.10, sb-v2.js).
- * Configurazione dal tag: window.sbConfig = { appId, userCookie?, scrollEvent?, spa?, performanceTiming?, depth?, articleSelector?, collector? }.
+ * Configurazione dal tag: window.sbConfig = { appId, userCookie?, scrollEvent?, spa?, performanceTiming?, depth?, articleSelector?,
+ *   scrollDepth?, titleSelector?, matchByOrder?, findArticle?, collector? }.
  * Documentazione: collector/docs/scroll-engagement.md e tracker/gtm/README.md.
  */
 (function (window, document) {
@@ -23,6 +24,15 @@
   // Profondità di lettura: quanta parte del corpo dell'articolo è passata nella finestra (0-100).
   var depthEnabled = config.depth !== false;
   var articleSelector = config.articleSelector || "article";
+  // Profondità anche sugli articoli dello scroll continuo (da engage-1.2.0): accesa con depth, spenta con scrollDepth = false.
+  var scrollDepthEnabled = depthEnabled && config.scrollDepth !== false;
+  // Titolo dentro ogni articleSelector, per riconoscere l'articolo spinto dallo scroll.
+  var titleSelector = config.titleSelector || "h1, h2";
+  // Facoltativa: function (url, title, position) -> elemento dell'articolo, per siti dove titolo e ordine non bastano.
+  var findArticleHook = typeof config.findArticle === "function" ? config.findArticle : null;
+  // Facoltativo: se il titolo non corrisponde, prendere l'n-esimo articleSelector per la posizione n.
+  // Spento per impostazione predefinita: un articleSelector estraneo (card correlate, widget) sposterebbe la misura.
+  var matchByOrder = config.matchByOrder === true;
   // Navigazione interna dei siti SPA (Next.js…): spenta per impostazione predefinita, si accende con sbConfig.spa = true.
   var spaEnabled = config.spa === true;
 
@@ -47,10 +57,47 @@
   var currentViewId;
   var currentPosition = 0;             // posizione della visualizzazione corrente nello scroll
   var maxDepth = null;                 // profondità massima raggiunta dalla visualizzazione corrente
+  var currentArticle = null;           // elemento dell'articolo dello scroll corrente (null = non trovato)
+  var currentTitleKey = "";            // titolo della visualizzazione corrente, normalizzato per il confronto
+  var lastFind = 0;                    // ultimo tentativo di trovare l'articolo (ms)
 
-  // Corpo dell'articolo (sbConfig.articleSelector, predefinito "article"); se manca, la pagina intera.
+  function titleText(title) {
+    // "Titolo | Giornale di Brescia" -> "titolo": confronto senza nome della testata, spazi e maiuscole
+    return String(title || "").split(" | ")[0].replace(/\s+/g, " ").trim().toLowerCase();
+  }
+
+  // Articolo dello scroll continuo nella pagina: funzione del sito (findArticle), poi per titolo
+  // (titleSelector dentro ogni articleSelector), poi, solo con matchByOrder, per ordine (l'n-esimo articleSelector).
+  // Se nessuno regge: null, e quella visualizzazione resta senza profondità (meglio vuota che sbagliata).
+  function findArticle() {
+    lastFind = Date.now();
+    if (findArticleHook) {
+      try { return findArticleHook(currentUrl, currentTitle, currentPosition) || null; } catch (e) { return null; }
+    }
+    var articles = document.querySelectorAll(articleSelector);
+    if (currentTitleKey) {
+      for (var i = 0; i < articles.length; i++) {
+        var heading = articles[i].querySelector(titleSelector);
+        if (heading && titleText(heading.textContent) === currentTitleKey) return articles[i];
+      }
+    }
+    return matchByOrder && articles.length > currentPosition ? articles[currentPosition] : null;
+  }
+
+  // Corpo da misurare. Pagina aperta: il primo articleSelector, se manca la pagina intera.
+  // Articolo dello scroll: l'elemento trovato con findArticle, se manca niente misura.
   function articleBox() {
-    var element = document.querySelector(articleSelector);
+    var element;
+    if (currentPosition > 0) {
+      if (!currentArticle || !document.documentElement.contains(currentArticle)) {
+        // l'articolo può arrivare nel DOM dopo il push: nuovo tentativo al massimo una volta al secondo
+        currentArticle = Date.now() - lastFind > 1000 ? findArticle() : null;
+      }
+      element = currentArticle;
+      if (!element) return null;
+    } else {
+      element = document.querySelector(articleSelector);
+    }
     if (element) {
       var rect = element.getBoundingClientRect();
       return { top: rect.top + window.pageYOffset, height: rect.height };
@@ -60,12 +107,11 @@
   }
 
   // Aggiorna la profondità massima: fondo della finestra rispetto al corpo dell'articolo.
-  // Solo per la pagina aperta: con lo scroll continuo gli articoli successivi sono nella stessa pagina
-  // e il selettore non li distingue ancora.
+  // Articoli dello scroll continuo: da engage-1.2.0, salvo scrollDepth = false.
   function measureDepth() {
-    if (!depthEnabled || currentPosition > 0) return;
+    if (!depthEnabled || (currentPosition > 0 && !scrollDepthEnabled)) return;
     var box = articleBox();
-    if (!box.height) return;
+    if (!box || !box.height) return;
     var bottom = window.pageYOffset + window.innerHeight;
     var depth = Math.round(Math.max(0, Math.min(1, (bottom - box.top) / box.height)) * 100);
     if (maxDepth === null || depth > maxDepth) maxDepth = depth;
@@ -103,7 +149,7 @@
     awayMs = 0;
     measureDepth();
     var data = { url: currentUrl, view_id: currentViewId, seconds: takeReadingSeconds(), away: awaySeconds, trigger: trigger };
-    if (maxDepth !== null && currentPosition === 0) data.depth = maxDepth;
+    if (maxDepth !== null) data.depth = maxDepth;
     return { schema: SCHEMA + "engagement/jsonschema/1-0-0", data: data };
   }
 
@@ -194,10 +240,13 @@
       });
     }
     currentTitle = title || document.title;
+    currentTitleKey = titleText(currentTitle);
     currentPosition = position;
+    currentArticle = null;
+    lastFind = 0;                       // nuova visualizzazione: l'articolo si cerca subito alla prima misura
     currentViewId = contexts[0].data.view_id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
     tracker("trackPageView", { title: title, context: contexts });
-    if (kind === "navigation") measureDepth();
+    if (kind !== "open") measureDepth();
   }
 
   // --- Avvio (in coda: il tracker incluso sotto la esegue appena caricato) -----
